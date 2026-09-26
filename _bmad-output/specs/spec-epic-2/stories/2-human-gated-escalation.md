@@ -2,7 +2,7 @@
 title: 'Human-gated escalation'
 type: 'feature'
 created: '2026-09-26'
-status: 'in-review'
+status: 'done'
 baseline_commit: 'c6d295af60afc32a66461b5093fec9df200f4cb3'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -76,6 +76,23 @@ context:
 ## Spec Change Log
 
 ## Review Triage Log
+
+Code review against `epic/2` (four layers): no violation of the spec. Patched the following, all in `agent.py` and `tests/test_agent.py`.
+
+| Finding | Verdict | Route | Evidence |
+|---|---|---|---|
+| Model chooses which ticket is escalated (blind, edge, acceptance) | medium | patch | The person was asked about, and the tool ran on, the model's `ticket_id`. Now any other ticket is rejected without a prompt. Test added. |
+| Retry runs the escalation tool twice; one yes could approve more calls (blind, edge, acceptance) | medium | patch | On retry the cached yes approved the tool again. Now only one approval runs the tool; repeats are turned down. Test updated. |
+| Model-written `reason` shown to the person unsanitised (blind, edge) | medium | patch | Untrusted text with escapes or newlines could forge the prompt. Now printable characters only, 200 max. Test added. |
+| Async `approve` untested (gap, edge, blind) | medium | patch | Test added. |
+| A retry after "no" untested (gap) | medium | patch | Test added: asked once, `Not escalated.` printed once. |
+| P1-and-Enterprise enforced only by the prompt (blind, acceptance) | low | rejected | By design in the frozen spec; the person's yes is the gate. |
+| Confirmation line prints before the tool runs (blind, edge, acceptance) | low | rejected | The spec says print after the person answers. |
+| Blocking `input()` in the event loop; `KeyboardInterrupt`; `approve` raising or returning non-bool; unbounded resume loop; malformed interrupt payloads (blind, edge) | low | rejected | Fails closed or is stopped by the graph limit; guards add complexity. |
+| Docs for the `approve` hook (blind) | low | rejected | The fix edits agent-context files or the spec. |
+| "No" test infers the tool did not run from messages (blind, gap) | low | rejected | The model receives a rejection and no tool result; the live `no` trace has no `escalate_to_human` span. |
+| Live checks on Groq only (blind) | maybe-false | defer | Gemini quota was exhausted; see deferred-work. |
+| MLflow `on_interrupt` and `on_resume` errors (blind) | low | defer | MLflow 3.16.1 tracer lacks the callbacks; noise only. |
 
 ## Design Notes
 

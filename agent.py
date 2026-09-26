@@ -70,6 +70,11 @@ def _is_yes(answer) -> bool:
     return isinstance(answer, str) and answer.strip().lower() in ("y", "yes")
 
 
+def _clean(text, limit: int = 200) -> str:
+    """Make model-written text safe to show a person: printable characters only, capped in length."""
+    return "".join(ch for ch in str(text) if ch.isprintable())[:limit]
+
+
 def _terminal_approve(ticket_id: str, reason: str) -> bool:
     """Ask at the terminal. Only an explicit yes approves; empty answer or closed stdin rejects."""
     try:
@@ -125,17 +130,24 @@ async def triage(ticket_id: str, *, model=None, approve=None) -> dict:
     run_id = uuid.uuid4().hex
     answer = None  # the person's first answer, reused if the retry runs the agent again
 
+    escalated = False  # the tool has run once; a repeat call, even on a retry, is turned down
+
     async def decide(action: dict) -> dict:
-        nonlocal answer
+        nonlocal answer, escalated
+        args = action.get("args", {})
+        if str(args.get("ticket_id", "")).strip() != ticket_id:
+            # ticket text is untrusted: only the ticket being triaged can be escalated
+            return {"type": "reject", "message": f"You may only escalate ticket {ticket_id}. Return your decision."}
+        if escalated:
+            return {"type": "reject", "message": "Already escalated. Return your decision."}
         if answer is None:
-            args = action.get("args", {})
-            asked_id = str(args.get("ticket_id") or ticket_id)
-            reply = approve(asked_id, str(args.get("reason", "")))
+            reply = approve(ticket_id, _clean(args.get("reason", "")))
             if inspect.isawaitable(reply):
                 reply = await reply
             answer = reply is True or _is_yes(reply)
-            print(f"Escalated ticket {asked_id} to a human." if answer else "Not escalated.")
+            print(f"Escalated ticket {ticket_id} to a human." if answer else "Not escalated.")
         if answer:
+            escalated = True
             return {"type": "approve"}
         return {"type": "reject", "message": "A person declined the escalation. Do not escalate; return your decision."}
 

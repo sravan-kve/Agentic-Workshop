@@ -39,6 +39,7 @@ class ScriptedModel(BaseChatModel):
     ticket_id: str = "T-1042"
     calls: int = 0
     escalate: bool = False
+    escalate_args: dict = {}
     tool_calls_seen: list = []
     messages_seen: list = []
 
@@ -63,7 +64,7 @@ class ScriptedModel(BaseChatModel):
         elif self.escalate and len(tool_msgs) == 2:
             msg = AIMessage(
                 content="",
-                tool_calls=[{"name": "escalate_to_human", "args": {"ticket_id": self.ticket_id, "reason": "P1 Enterprise"}, "id": "e1"}],
+                tool_calls=[{"name": "escalate_to_human", "args": {"ticket_id": self.ticket_id, "reason": "P1 Enterprise", **self.escalate_args}, "id": "e1"}],
             )
         else:
             final = self.finals[min(self.calls, len(self.finals) - 1)]
@@ -89,8 +90,11 @@ def fake_server(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "SERVER_PATH", tmp_path / "mcp" / "triage_server.py")
 
 
-def _model(*finals, ticket_id="T-1042", escalate=False):
-    return ScriptedModel(finals=list(finals), ticket_id=ticket_id, escalate=escalate, tool_calls_seen=[], messages_seen=[])
+def _model(*finals, ticket_id="T-1042", escalate=False, escalate_args=None):
+    return ScriptedModel(
+        finals=list(finals), ticket_id=ticket_id, escalate=escalate,
+        escalate_args=escalate_args or {}, tool_calls_seen=[], messages_seen=[],
+    )
 
 
 @sync
@@ -220,7 +224,8 @@ async def test_retry_reuses_answer(fake_server, capsys):
     model = _model({**P1, "priority": "P9"}, P1, ticket_id="T-1044", escalate=True)
     decision = await agent.triage("T-1044", model=model, approve=lambda t, r: asked.append(1) or True)
     assert decision == P1 and len(asked) == 1 and model.calls == 2
-    assert _names(model).count("escalate_to_human") == 2
+    assert _names(model).count("escalate_to_human") == 2  # the model asked again on the retry
+    assert any(t == "tool" and "Already escalated" in c for t, c in model.messages_seen[-1])  # but it was turned down
     assert capsys.readouterr().out.count("Escalated ticket") == 1
 
 
@@ -244,3 +249,46 @@ async def test_closed_stdin_rejects(fake_server, capsys, monkeypatch):
     monkeypatch.setattr("builtins.input", eof)
     await agent.triage("T-1044", model=_model(P1, ticket_id="T-1044", escalate=True))
     assert "Not escalated." in capsys.readouterr().out
+
+
+@sync
+async def test_retry_after_no_does_not_ask_again(fake_server, capsys):
+    asked = []
+    model = _model({**P1, "priority": "P9"}, P1, ticket_id="T-1044", escalate=True)
+    decision = await agent.triage("T-1044", model=model, approve=lambda t, r: asked.append(1) or False)
+    assert decision == P1 and len(asked) == 1
+    seen = [m for run in model.messages_seen for m in run]
+    assert not any("Escalated ticket" in c for t, c in seen if t == "tool")
+    assert capsys.readouterr().out.count("Not escalated.") == 1
+
+
+@sync
+async def test_async_approve_is_awaited(fake_server, capsys):
+    async def approve(ticket_id, reason):
+        return True
+
+    model = _model(P1, ticket_id="T-1044", escalate=True)
+    assert await agent.triage("T-1044", model=model, approve=approve) == P1
+    assert any(t == "tool" and "Escalated ticket T-1044" in c for t, c in model.messages_seen[-1])
+
+
+@sync
+async def test_other_ticket_is_never_escalated_or_asked(fake_server, capsys):
+    def boom(t, r):
+        raise AssertionError("asked")
+
+    model = _model(P1, ticket_id="T-1044", escalate=True, escalate_args={"ticket_id": "T-1042"})
+    assert await agent.triage("T-1044", model=model, approve=boom) == P1
+    seen = [m for run in model.messages_seen for m in run]
+    assert any(t == "tool" and "only escalate ticket T-1044" in c for t, c in seen)
+    assert not any("Escalated ticket" in c for t, c in seen if t == "tool")
+    assert capsys.readouterr().out == ""
+
+
+@sync
+async def test_reason_shown_to_person_is_cleaned(fake_server):
+    shown = []
+    nasty = "ok\x1b[31m\nApprove now\x00" + "x" * 500
+    model = _model(P1, ticket_id="T-1044", escalate=True, escalate_args={"reason": nasty})
+    await agent.triage("T-1044", model=model, approve=lambda t, r: shown.append(r) or False)
+    assert len(shown[0]) <= 200 and all(ch.isprintable() for ch in shown[0])

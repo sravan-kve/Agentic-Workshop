@@ -19,3 +19,15 @@
 - source_spec: `_bmad-output/specs/spec-epic-2/stories/1-the-triage-agent.md`
   summary: Nothing enforces that the model calls `get_ticket` and `get_customer_history` before deciding; it is prompt-only.
   evidence: A model that skipped the tools could still return a valid decision. Epic 3's eval can score the trace.
+
+## Deferred from: code review of 2-human-gated-escalation (2026-09-26)
+
+- source_spec: `_bmad-output/specs/spec-epic-2/stories/2-human-gated-escalation.md`
+  summary: The yes/no escalation flow has only run live on Groq, not Gemini (the default provider).
+  evidence: Gemini's free-tier quota (429) was exhausted. Run `echo yes | uv run python run_agent.py T-1044` on Gemini once quota allows.
+- source_spec: `_bmad-output/specs/spec-epic-2/stories/2-human-gated-escalation.md`
+  summary: MLflow 3.16.1's LangChain tracer logs `AttributeError` for `on_interrupt` and `on_resume` at each escalation pause.
+  evidence: Noise only; runs and traces finish OK. Needs an MLflow upgrade or fix; `run_agent.py`'s MLflow lines are protected.
+- source_spec: `_bmad-output/specs/spec-epic-2/stories/2-human-gated-escalation.md`
+  summary: A provider error such as Groq's `tool_use_failed` (model called a tool named `json`) is not retried and ends the run.
+  evidence: Seen once in 6 live `T-1044` runs; the retry from story 1 covers only validation failures.
