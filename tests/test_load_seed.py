@@ -1,15 +1,13 @@
 import csv
 import sqlite3
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mcp"))
-
 import load_seed
 
-SEED = Path(__file__).resolve().parent.parent / "seed"
+ROOT = Path(__file__).resolve().parent.parent
+SEED = ROOT / "seed"
 
 
 @pytest.fixture
@@ -39,7 +37,7 @@ def test_one_row_per_csv_row_with_matching_values(db, table):
     expected = _csv_rows(table)
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
-        actual = [dict(r) for r in conn.execute(f"SELECT * FROM {table}")]
+        actual = [dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
     assert len(actual) == len(expected) > 0
     for got, want in zip(actual, expected):
         assert {k: str(v) for k, v in got.items()} == want
@@ -58,7 +56,7 @@ def test_known_rows_are_found(db):
 
 
 def test_mcp_server_reads_the_loaded_db(db, monkeypatch):
-    pytest.importorskip("mcp.server.fastmcp")
+    monkeypatch.syspath_prepend(str(ROOT / "mcp"))
     import triage_server
 
     monkeypatch.setattr(triage_server, "DB_PATH", db)
@@ -68,13 +66,15 @@ def test_mcp_server_reads_the_loaded_db(db, monkeypatch):
     assert "T-1042" in customer["ticket_ids"]
 
 
-def test_header_mismatch_fails_before_writing_anything(tmp_path):
+@pytest.mark.parametrize("bad", ["tickets", "customers"])
+def test_header_mismatch_fails_before_writing_anything(tmp_path, bad):
     seed = tmp_path / "seed"
     seed.mkdir()
-    (seed / "tickets.csv").write_text("ticket_id,wrong\nT-1,x\n")
-    (seed / "customers.csv").write_text((SEED / "customers.csv").read_text())
+    for name in ("tickets", "customers"):
+        text = "id,wrong\n1,x\n" if name == bad else (SEED / f"{name}.csv").read_text(encoding="utf-8")
+        (seed / f"{name}.csv").write_text(text, encoding="utf-8")
     path = tmp_path / "app.db"
-    with pytest.raises(ValueError, match="tickets.csv"):
+    with pytest.raises(ValueError, match=f"{bad}.csv"):
         load_seed.load(path, seed)
     assert not path.exists()
 

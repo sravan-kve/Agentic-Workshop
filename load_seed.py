@@ -2,6 +2,7 @@
 
 import csv
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -28,7 +29,7 @@ def _read_rows(table: str, columns: tuple[str, ...], seed_dir: Path) -> list[tup
 def load(db_path: Path = DB_PATH, seed_dir: Path = SEED_DIR) -> dict[str, int]:
     """Create the tables in db_path from the seed CSVs; return the row count per table."""
     data = {table: _read_rows(table, columns, seed_dir) for table, columns in TABLES.items()}
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         for table, columns in TABLES.items():
             defs = ", ".join(f"{c} INTEGER" if c in INTEGER_COLUMNS else f"{c} TEXT" for c in columns)
             conn.execute(f"CREATE TABLE {table} ({defs})")
