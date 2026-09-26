@@ -30,6 +30,7 @@ DEFAULT_WAIT = 20
 
 _lock = threading.Lock()
 _approved: set[str] = set()  # ticket ids, so a retried ticket counts once
+_errored: set[str] = set()  # tickets whose agent call ended in an error
 
 
 def load_rows(path: Path = LABELS_CSV) -> list[dict]:
@@ -63,9 +64,16 @@ def reset_approved() -> None:
         _approved.clear()
 
 
+def errored_count() -> int:
+    with _lock:
+        return len(_errored)
+
+
+_RATE_LIMIT = re.compile(r"error code: 429|status(?:_code)?[ :=]+429|rate.?limit|resource_exhausted|too many requests")
+
+
 def _is_rate_limit(err: Exception) -> bool:
-    text = f"{type(err).__name__} {err}".lower()
-    return "429" in text or "rate limit" in text or "resource_exhausted" in text or "ratelimit" in text
+    return bool(_RATE_LIMIT.search(f"{type(err).__name__} {err}".lower()))
 
 
 def _retry_wait(err: Exception) -> float:
@@ -89,6 +97,8 @@ def predict(ticket_id: str) -> dict:
             if _is_rate_limit(err) and attempt < RATE_LIMIT_RETRIES:
                 time.sleep(_retry_wait(err))
                 continue
+            with _lock:
+                _errored.add(ticket_id)
             return {"error": str(err) or type(err).__name__}
 
 
@@ -120,9 +130,9 @@ def priority_match(outputs, expectations) -> int:
 
 
 @scorer
-def tool_order(trace) -> int:
-    if trace is None:
-        return 0
+def tool_order(outputs, trace) -> int:
+    if trace is None or (isinstance(outputs, dict) and "error" in outputs):
+        return 0  # a ticket the agent failed on scores 0 on every scorer
     spans = trace.data.spans
     ticket = [s.start_time_ns for s in spans if s.name == "get_ticket"]
     history = [s.start_time_ns for s in spans if s.name == "get_customer_history"]
@@ -136,6 +146,8 @@ SCORERS = [valid_schema, category_match, priority_match, tool_order]
 
 def run_eval(rows: list[dict] | None = None):
     reset_approved()
+    with _lock:
+        _errored.clear()
     # one ticket at a time by default: provider token-per-minute limits are low; the user can raise it
     os.environ.setdefault("MLFLOW_GENAI_EVAL_MAX_WORKERS", "1")
     return mlflow.genai.evaluate(
@@ -158,6 +170,7 @@ def main() -> None:
         value = result.metrics.get(f"{name}/mean")
         print(f"{name}: {value:.2f}" if value is not None else f"{name}: n/a")
     print(f"auto-approved escalations: {approved_count()}")
+    print(f"tickets with agent errors: {errored_count()}")
 
 
 if __name__ == "__main__":

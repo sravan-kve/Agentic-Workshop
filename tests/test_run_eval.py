@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,11 +53,11 @@ def test_matchers():
 
 
 def test_tool_order():
-    assert run_eval.tool_order(trace=fake_trace(("get_ticket", 1), ("get_customer_history", 2))) == 1
-    assert run_eval.tool_order(trace=fake_trace(("get_customer_history", 1), ("get_ticket", 2))) == 0
-    assert run_eval.tool_order(trace=fake_trace(("get_ticket", 1))) == 0
-    assert run_eval.tool_order(trace=fake_trace(("get_customer_history", 1))) == 0
-    assert run_eval.tool_order(trace=fake_trace()) == 0
+    assert run_eval.tool_order(outputs=GOOD, trace=fake_trace(("get_ticket", 1), ("get_customer_history", 2))) == 1
+    assert run_eval.tool_order(outputs=GOOD, trace=fake_trace(("get_customer_history", 1), ("get_ticket", 2))) == 0
+    assert run_eval.tool_order(outputs=GOOD, trace=fake_trace(("get_ticket", 1))) == 0
+    assert run_eval.tool_order(outputs=GOOD, trace=fake_trace(("get_customer_history", 1))) == 0
+    assert run_eval.tool_order(outputs=GOOD, trace=fake_trace()) == 0
 
 
 def test_approve_counts():
@@ -89,18 +90,24 @@ def test_evaluate_one_run_with_scores(monkeypatch, tmp_path):
         return GOOD
 
     monkeypatch.setattr(agent, "triage", fake_triage)
+    monkeypatch.setenv("MLFLOW_GENAI_EVAL_MAX_WORKERS", "1")  # restored after the test
+    previous_uri = mlflow.get_tracking_uri()
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
-    mlflow.set_experiment("triage-agent-test")
-    rows = [r for r in run_eval.load_rows() if r["inputs"]["ticket_id"] in ("T-1042", "T-1043", "T-1044")]
-    result = run_eval.run_eval(rows)
+    try:
+        mlflow.set_experiment("triage-agent-test")
+        rows = [r for r in run_eval.load_rows() if r["inputs"]["ticket_id"] in ("T-1042", "T-1043", "T-1044")]
+        result = run_eval.run_eval(rows)
 
-    assert run_eval.approved_count() == 1
-    exp = mlflow.get_experiment_by_name("triage-agent-test")
-    assert len(mlflow.search_runs([exp.experiment_id])) == 1
+        assert run_eval.approved_count() == 1 and run_eval.errored_count() == 1
+        exp = mlflow.get_experiment_by_name("triage-agent-test")
+        assert len(mlflow.search_runs([exp.experiment_id])) == 1
+    finally:
+        mlflow.set_tracking_uri(previous_uri)
+    # T-1042 matches its labels (billing/P2); T-1043 errors (0 on all four); T-1044 returns billing/P2 but is labelled access/P1
     assert result.metrics["valid_schema/mean"] == pytest.approx(2 / 3)
+    assert result.metrics["category_match/mean"] == pytest.approx(1 / 3)
+    assert result.metrics["priority_match/mean"] == pytest.approx(1 / 3)
     assert result.metrics["tool_order/mean"] == pytest.approx(2 / 3)
-    assert 0 <= result.metrics["category_match/mean"] <= 1
-    assert result.metrics["priority_match/mean"] <= 2 / 3
 
 
 def test_approve_counts_each_ticket_once():
@@ -125,9 +132,6 @@ def _patch_triage(monkeypatch, behaviours):
 
     monkeypatch.setattr(agent, "triage", fake_triage)
     return calls
-
-
-GOOD = {"category": "billing", "priority": "P2", "route": "billing-team", "rationale": "ok"}
 
 
 def test_predict_waits_and_retries_on_rate_limit(monkeypatch):
@@ -158,3 +162,49 @@ def test_retry_wait_uses_the_hint_and_is_capped():
     assert run_eval._retry_wait(RuntimeError("try again in 250ms")) == pytest.approx(1.25)
     assert run_eval._retry_wait(RuntimeError("try again in 5m")) == run_eval.RATE_LIMIT_MAX_WAIT
     assert run_eval._retry_wait(RuntimeError("no hint")) == run_eval.DEFAULT_WAIT
+
+
+def test_tool_order_is_zero_for_an_errored_ticket_even_if_the_tools_ran():
+    trace = fake_trace(("get_ticket", 1), ("get_customer_history", 2))
+    assert run_eval.tool_order(outputs={"error": "boom"}, trace=trace) == 0
+    assert run_eval.tool_order(outputs=GOOD, trace=trace) == 1
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Error code: 429 - Rate limit reached", True),
+        ("RESOURCE_EXHAUSTED quota", True),
+        ("Too Many Requests", True),
+        ("ticket T-4290 not found, port 14291", False),
+        ("model exploded", False),
+    ],
+)
+def test_rate_limit_detection(text, expected):
+    assert run_eval._is_rate_limit(RuntimeError(text)) is expected
+
+
+def test_worker_default_is_one_and_a_caller_value_is_kept(monkeypatch):
+    seen = []
+    monkeypatch.setattr(mlflow.genai, "evaluate", lambda **kw: seen.append(os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"]) or SimpleNamespace(metrics={}))
+    monkeypatch.setenv("MLFLOW_GENAI_EVAL_MAX_WORKERS", "x")
+    monkeypatch.delenv("MLFLOW_GENAI_EVAL_MAX_WORKERS")  # records the original state so it is restored
+    run_eval.run_eval([])
+    monkeypatch.setenv("MLFLOW_GENAI_EVAL_MAX_WORKERS", "3")
+    run_eval.run_eval([])
+    assert seen == ["1", "3"]
+
+
+def test_main_prints_means_and_counts(monkeypatch, capsys):
+    setup = []
+    monkeypatch.setattr(mlflow, "set_tracking_uri", lambda uri: setup.append(("uri", uri)))
+    monkeypatch.setattr(mlflow, "set_experiment", lambda name: setup.append(("exp", name)))
+    monkeypatch.setattr(mlflow.langchain, "autolog", lambda: setup.append(("autolog", None)))
+    metrics = {"valid_schema/mean": 1.0, "category_match/mean": 0.95, "priority_match/mean": 0.5}
+    monkeypatch.setattr(run_eval, "run_eval", lambda: SimpleNamespace(metrics=metrics))
+    run_eval.main()
+    out = capsys.readouterr().out
+    assert ("uri", "sqlite:///mlflow.db") in setup and ("exp", "triage-agent") in setup and ("autolog", None) in setup
+    for line in ("valid_schema: 1.00", "category_match: 0.95", "priority_match: 0.50", "tool_order: n/a",
+                 "auto-approved escalations: ", "tickets with agent errors: "):
+        assert line in out

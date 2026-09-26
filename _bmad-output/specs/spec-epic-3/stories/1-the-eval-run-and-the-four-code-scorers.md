@@ -2,7 +2,7 @@
 title: 'The eval run and the four code scorers'
 type: 'feature'
 created: '2026-09-26'
-status: 'in-review'
+status: 'done'
 baseline_commit: '53e0dd7e330c518a4c5a6076435964eedd1e5f80'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -74,7 +74,24 @@ context:
 
 ## Spec Change Log
 
+- 2026-09-26, found on the first live run, not raised by a reviewer: the frozen text says a failing ticket returns `{"error": ...}` and scores 0, and that MLflow runs tickets in parallel. On Groq's free tier (8,000 tokens a minute, 10 parallel workers by default) 16 of 20 tickets hit a 429, so the first live run scored 0.20 on most scorers. The code now waits and retries a rate-limited ticket (up to 5 times, waiting the provider's hint, capped at 60 s) and defaults `MLFLOW_GENAI_EVAL_MAX_WORKERS` to 1. Other errors are still not retried. The frozen block was not edited; a human should decide whether to add a rate-limit row to the matrix through `/bmad-spec`. Known-bad state avoided: a run that finishes but scores 0 because of provider limits, not the agent. KEEP: rate-limit retry limited to `predict`, agent code untouched.
+
 ## Review Triage Log
+
+Code review against `epic/3` (four layers): no hard violation of CAP-1 to 5 or CAP-8.
+
+| Finding | Verdict | Route | Evidence |
+|---|---|---|---|
+| `tool_order` scored 1 for a ticket that errored after the tools ran (blind, edge) | medium | patch | Contradicted the frozen "error scores 0 on every scorer". Now 0 when the output is an error. Test added. |
+| Rate-limit detection matched the digits `429` anywhere (blind, edge, acceptance) | medium | patch | Non-rate-limit errors would sleep and retry. Now matches specific phrases; tests added. |
+| Nothing reports how many tickets errored (blind) | medium | patch | This is how the first live run silently scored 0. Now prints `tickets with agent errors: N`. Test added. |
+| Evaluate test bounds were vacuous; worker default and `main` unchecked; `GOOD` defined twice; global state leaked (gap, blind, acceptance) | medium | patch | Exact per-scorer values now asserted; tests for the worker default, a caller-set value, and `main`; state restored. |
+| Retry and worker cap not in the frozen spec (blind, acceptance) | medium | logged | Recorded in the Spec Change Log; the frozen block was not edited. |
+| Retries run inside one trace so failed attempts add spans (blind, edge, acceptance) | low | rejected | `tool_order` compares the first spans; a failed attempt that reached only `get_ticket` cannot flip it. Live run showed 20 clean traces. |
+| Count of approvals is per ticket, not per call (edge, acceptance) | low | rejected | Deliberate: a retried ticket must count once. |
+| `import agent` outside the `try` (blind) | low | rejected | A broken import should fail the run loudly, not score every ticket 0. |
+| CSV validation, `MAX_WORKERS` edge values, compound retry hints, no total deadline, NaN metrics, running event loop (edge) | low | rejected | Unlikely in the workshop flow; each fix adds guards. |
+| Run ID and runtime not printed or documented (blind) | low | rejected | Cosmetic. |
 
 ## Design Notes
 
