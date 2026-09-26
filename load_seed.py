@@ -27,10 +27,16 @@ def _read_rows(table: str, columns: tuple[str, ...], seed_dir: Path) -> list[tup
 
 
 def load(db_path: Path = DB_PATH, seed_dir: Path = SEED_DIR) -> dict[str, int]:
-    """Create the tables in db_path from the seed CSVs; return the row count per table."""
+    """Rebuild the tables in db_path from the seed CSVs; return the row count per table.
+
+    Existing tables are dropped in the same transaction, so a re-run gives the same
+    rows and a failed load leaves the previous database untouched.
+    """
     data = {table: _read_rows(table, columns, seed_dir) for table, columns in TABLES.items()}
     with closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.execute("BEGIN")
         for table, columns in TABLES.items():
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
             defs = ", ".join(f"{c} INTEGER" if c in INTEGER_COLUMNS else f"{c} TEXT" for c in columns)
             conn.execute(f"CREATE TABLE {table} ({defs})")
             marks = ", ".join("?" for _ in columns)
@@ -39,7 +45,7 @@ def load(db_path: Path = DB_PATH, seed_dir: Path = SEED_DIR) -> dict[str, int]:
 
 
 def main() -> None:
-    counts = load()
+    counts = load(DB_PATH, SEED_DIR)
     print(f"Loaded {counts['tickets']} tickets and {counts['customers']} customers into {DB_PATH.name}")
 
 
