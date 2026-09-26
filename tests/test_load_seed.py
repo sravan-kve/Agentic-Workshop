@@ -83,3 +83,65 @@ def test_seed_files_are_only_read(tmp_path):
     before = {p.name: p.read_bytes() for p in SEED.glob("*.csv")}
     load_seed.load(tmp_path / "app.db", SEED)
     assert {p.name: p.read_bytes() for p in SEED.glob("*.csv")} == before
+
+
+def _dump(path):
+    with sqlite3.connect(path) as conn:
+        return {t: conn.execute(f"SELECT * FROM {t} ORDER BY rowid").fetchall() for t in ("tickets", "customers")}
+
+
+def test_running_twice_leaves_identical_rows(tmp_path):
+    path = tmp_path / "app.db"
+    first_counts = load_seed.load(path, SEED)
+    first = _dump(path)
+    assert load_seed.load(path, SEED) == first_counts
+    assert _dump(path) == first
+    assert {t: len(rows) for t, rows in first.items()} == {t: len(_csv_rows(t)) for t in first}
+
+
+def test_main_exits_cleanly_twice(tmp_path, monkeypatch):
+    monkeypatch.setattr(load_seed, "DB_PATH", tmp_path / "app.db")
+    load_seed.main()
+    load_seed.main()
+    assert len(_dump(tmp_path / "app.db")["tickets"]) == len(_csv_rows("tickets"))
+
+
+def test_rerun_replaces_stale_rows(tmp_path):
+    path = tmp_path / "app.db"
+    load_seed.load(path, SEED)
+    with sqlite3.connect(path) as conn:
+        conn.execute("INSERT INTO tickets VALUES ('T-9999', 'C-77', 'now', 'stale')")
+        conn.execute("DELETE FROM customers WHERE customer_id = 'C-77'")
+    load_seed.load(path, SEED)
+    rebuilt = _dump(path)
+    for table in ("tickets", "customers"):
+        assert rebuilt[table] == [tuple(r.values()) if table == "tickets" else (r["customer_id"], r["name"], r["plan"], int(r["open_tickets"])) for r in _csv_rows(table)]
+
+
+def test_failed_rerun_keeps_previous_database(tmp_path):
+    path = tmp_path / "app.db"
+    load_seed.load(path, SEED)
+    before = _dump(path)
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "tickets.csv").write_text((SEED / "tickets.csv").read_text(encoding="utf-8"), encoding="utf-8")
+    (seed / "customers.csv").write_text("customer_id,name,plan,open_tickets\nC-1,X,Team,many\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_seed.load(path, seed)
+    assert _dump(path) == before
+
+
+def test_insert_failure_after_drop_keeps_previous_database(tmp_path, monkeypatch):
+    path = tmp_path / "app.db"
+    load_seed.load(path, SEED)
+    before = _dump(path)
+    real_read_rows = load_seed._read_rows
+
+    def bad_customers(table, columns, seed_dir):
+        rows = real_read_rows(table, columns, seed_dir)
+        return [row[:-1] for row in rows] if table == "customers" else rows  # wrong column count fails at INSERT
+
+    monkeypatch.setattr(load_seed, "_read_rows", bad_customers)
+    with pytest.raises(sqlite3.Error):
+        load_seed.load(path, SEED)
+    assert _dump(path) == before
