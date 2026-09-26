@@ -22,4 +22,8 @@ context:
 
 ## Implementation Notes
 
-`load()` now runs `BEGIN`, then `DROP TABLE IF EXISTS` and `CREATE TABLE` per table, then the inserts, in one transaction. CSVs are read and validated before the database is opened. `main()` passes `DB_PATH` explicitly so tests can redirect it. Tests cover two runs with identical rows, `main()` twice, stale rows replaced, and a bad CSV on re-run leaving the old database intact. The failed-re-run test fails at CSV parsing, before the transaction starts; it does not exercise a mid-insert rollback.
+`load()` now runs `BEGIN`, then `DROP TABLE IF EXISTS` and `CREATE TABLE` per table, then the inserts, in one transaction. CSVs are read and validated before the database is opened. `main()` passes `DB_PATH` explicitly so tests can redirect it. Tests cover two runs with identical rows, `main()` twice, stale rows replaced, and a bad CSV on re-run leaving the old database intact. One failed-re-run test fails at CSV parsing, before the transaction starts; a second forces an insert to fail after the drop and checks the old rows survive (it fails if `BEGIN` is removed).
+
+## Review Triage Log
+
+Code review against `spec/sravan-epic-1` (four layers): no violations of CAP-3. Patched: no test for a mid-insert rollback (added, verified to fail without `BEGIN`), and the stale-row test now compares full customer rows. Rejected as low or out of scope: primary keys and duplicate rows, database locks from a concurrent reader, header-only CSVs, corrupt or missing `app.db`, an empty `app.db` after a failed first load, a subprocess exit-code test (exit 0 twice was checked by hand), and frontmatter wording.

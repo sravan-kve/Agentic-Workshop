@@ -113,8 +113,9 @@ def test_rerun_replaces_stale_rows(tmp_path):
         conn.execute("INSERT INTO tickets VALUES ('T-9999', 'C-77', 'now', 'stale')")
         conn.execute("DELETE FROM customers WHERE customer_id = 'C-77'")
     load_seed.load(path, SEED)
-    assert _dump(path)["tickets"] == [tuple(r.values()) for r in _csv_rows("tickets")]
-    assert len(_dump(path)["customers"]) == len(_csv_rows("customers"))
+    rebuilt = _dump(path)
+    for table in ("tickets", "customers"):
+        assert rebuilt[table] == [tuple(r.values()) if table == "tickets" else (r["customer_id"], r["name"], r["plan"], int(r["open_tickets"])) for r in _csv_rows(table)]
 
 
 def test_failed_rerun_keeps_previous_database(tmp_path):
@@ -127,4 +128,20 @@ def test_failed_rerun_keeps_previous_database(tmp_path):
     (seed / "customers.csv").write_text("customer_id,name,plan,open_tickets\nC-1,X,Team,many\n", encoding="utf-8")
     with pytest.raises(ValueError):
         load_seed.load(path, seed)
+    assert _dump(path) == before
+
+
+def test_insert_failure_after_drop_keeps_previous_database(tmp_path, monkeypatch):
+    path = tmp_path / "app.db"
+    load_seed.load(path, SEED)
+    before = _dump(path)
+    real_read_rows = load_seed._read_rows
+
+    def bad_customers(table, columns, seed_dir):
+        rows = real_read_rows(table, columns, seed_dir)
+        return [row[:-1] for row in rows] if table == "customers" else rows  # wrong column count fails at INSERT
+
+    monkeypatch.setattr(load_seed, "_read_rows", bad_customers)
+    with pytest.raises(sqlite3.Error):
+        load_seed.load(path, SEED)
     assert _dump(path) == before
