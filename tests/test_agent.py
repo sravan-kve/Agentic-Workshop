@@ -38,6 +38,7 @@ class ScriptedModel(BaseChatModel):
     finals: list = []
     ticket_id: str = "T-1042"
     calls: int = 0
+    escalate: bool = False
     tool_calls_seen: list = []
     messages_seen: list = []
 
@@ -58,6 +59,11 @@ class ScriptedModel(BaseChatModel):
             msg = AIMessage(
                 content="",
                 tool_calls=[{"name": "get_customer_history", "args": {"customer_id": ticket["customer_id"]}, "id": "c2"}],
+            )
+        elif self.escalate and len(tool_msgs) == 2:
+            msg = AIMessage(
+                content="",
+                tool_calls=[{"name": "escalate_to_human", "args": {"ticket_id": self.ticket_id, "reason": "P1 Enterprise"}, "id": "e1"}],
             )
         else:
             final = self.finals[min(self.calls, len(self.finals) - 1)]
@@ -83,8 +89,8 @@ def fake_server(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "SERVER_PATH", tmp_path / "mcp" / "triage_server.py")
 
 
-def _model(*finals, ticket_id="T-1042"):
-    return ScriptedModel(finals=list(finals), ticket_id=ticket_id, tool_calls_seen=[], messages_seen=[])
+def _model(*finals, ticket_id="T-1042", escalate=False):
+    return ScriptedModel(finals=list(finals), ticket_id=ticket_id, escalate=escalate, tool_calls_seen=[], messages_seen=[])
 
 
 @sync
@@ -111,7 +117,7 @@ async def test_agent_receives_the_policy_and_data_only_rules(fake_server):
     await agent.triage("T-1042", model=model)
     system = next(c for t, c in model.messages_seen[0] if t == "system")
     assert (ROOT / "TRIAGE_POLICY.md").read_text() in system
-    assert "untrusted data" in system and "Never call it" in system
+    assert "untrusted data" in system and "escalate_to_human" in system and "exactly once" in system
 
 
 @sync
@@ -169,3 +175,72 @@ def test_system_prompt_is_policy_plus_rules():
     prompt = agent._system_prompt()
     assert (ROOT / "TRIAGE_POLICY.md").read_text() in prompt
     assert "get_ticket" in prompt and "get_customer_history" in prompt and "untrusted data" in prompt
+
+
+P1 = {**GOOD, "category": "access", "priority": "P1", "route": "access-team", "rationale": "Whole team locked out (P1)."}
+
+
+def _names(model):
+    return [c.split(":")[0] for c in model.tool_calls_seen]
+
+
+@sync
+async def test_yes_escalates_and_prints(fake_server, capsys):
+    asked = []
+    model = _model(P1, ticket_id="T-1044", escalate=True)
+    decision = await agent.triage("T-1044", model=model, approve=lambda t, r: asked.append((t, r)) or True)
+    assert decision == P1 and len(asked) == 1 and asked[0][0] == "T-1044"
+    assert "escalate_to_human" in _names(model)
+    assert any(t == "tool" and "Escalated ticket T-1044 to a human." in c for t, c in model.messages_seen[-1])
+    assert "Escalated ticket T-1044 to a human." in capsys.readouterr().out
+
+
+@sync
+async def test_no_does_not_run_tool(fake_server, capsys):
+    model = _model(P1, ticket_id="T-1044", escalate=True)
+    decision = await agent.triage("T-1044", model=model, approve=lambda t, r: False)
+    assert decision == P1
+    seen = [m for run in model.messages_seen for m in run]
+    assert not any("Escalated ticket T-1044 to a human." in c for t, c in seen if t == "tool")  # the tool body never ran
+    assert any(t == "tool" and "declined" in c for t, c in seen)  # the model was told it was rejected
+    assert capsys.readouterr().out.strip() == "Not escalated."
+
+
+@sync
+async def test_non_p1_never_asks(fake_server):
+    def boom(t, r):
+        raise AssertionError("asked")
+
+    assert await agent.triage("T-1042", model=_model(GOOD), approve=boom) == GOOD
+
+
+@sync
+async def test_retry_reuses_answer(fake_server, capsys):
+    asked = []
+    model = _model({**P1, "priority": "P9"}, P1, ticket_id="T-1044", escalate=True)
+    decision = await agent.triage("T-1044", model=model, approve=lambda t, r: asked.append(1) or True)
+    assert decision == P1 and len(asked) == 1 and model.calls == 2
+    assert _names(model).count("escalate_to_human") == 2
+    assert capsys.readouterr().out.count("Escalated ticket") == 1
+
+
+@pytest.mark.parametrize("reply", ["", "maybe", "no", "y ", " YES ", "Y"])
+@sync
+async def test_terminal_prompt_only_yes_approves(fake_server, capsys, monkeypatch, reply):
+    monkeypatch.setattr("builtins.input", lambda prompt="": reply)
+    await agent.triage("T-1044", model=_model(P1, ticket_id="T-1044", escalate=True))
+    out = capsys.readouterr().out
+    if reply.strip().lower() in ("y", "yes"):
+        assert "Escalated ticket T-1044 to a human." in out
+    else:
+        assert "Not escalated." in out
+
+
+@sync
+async def test_closed_stdin_rejects(fake_server, capsys, monkeypatch):
+    def eof(prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    await agent.triage("T-1044", model=_model(P1, ticket_id="T-1044", escalate=True))
+    assert "Not escalated." in capsys.readouterr().out
