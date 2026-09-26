@@ -8,11 +8,13 @@ import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import ToolException
 
 import agent
 import load_seed
 
 ROOT = Path(__file__).resolve().parent.parent
+
 
 def sync(fn):
     @functools.wraps(fn)
@@ -37,6 +39,7 @@ class ScriptedModel(BaseChatModel):
     ticket_id: str = "T-1042"
     calls: int = 0
     tool_calls_seen: list = []
+    messages_seen: list = []
 
     @property
     def _llm_type(self) -> str:
@@ -46,6 +49,7 @@ class ScriptedModel(BaseChatModel):
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.messages_seen.append([(m.type, _text(m)) for m in messages])
         tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
         if not tool_msgs:
             msg = AIMessage(content="", tool_calls=[{"name": "get_ticket", "args": {"ticket_id": self.ticket_id}, "id": "c1"}])
@@ -80,7 +84,7 @@ def fake_server(tmp_path, monkeypatch):
 
 
 def _model(*finals, ticket_id="T-1042"):
-    return ScriptedModel(finals=list(finals), ticket_id=ticket_id, tool_calls_seen=[])
+    return ScriptedModel(finals=list(finals), ticket_id=ticket_id, tool_calls_seen=[], messages_seen=[])
 
 
 @sync
@@ -98,6 +102,16 @@ async def test_invalid_output_retries_once_then_succeeds(fake_server):
     model = _model({**GOOD, "priority": "P9"}, GOOD)
     assert await agent.triage("T-1042", model=model) == GOOD
     assert model.calls == 2
+    assert any(t == "human" and "rejected" in c and "priority" in c for t, c in model.messages_seen[-1])
+
+
+@sync
+async def test_agent_receives_the_policy_and_data_only_rules(fake_server):
+    model = _model(GOOD)
+    await agent.triage("T-1042", model=model)
+    system = next(c for t, c in model.messages_seen[0] if t == "system")
+    assert (ROOT / "TRIAGE_POLICY.md").read_text() in system
+    assert "untrusted data" in system and "Never call it" in system
 
 
 @sync
@@ -111,7 +125,7 @@ async def test_invalid_output_twice_raises_with_validation_text(fake_server):
 
 @sync
 async def test_unknown_ticket_surfaces_tool_error(fake_server):
-    with pytest.raises(Exception, match="No ticket with ID T-0000"):
+    with pytest.raises(ToolException, match="No ticket with ID T-0000"):
         await agent.triage("T-0000", model=_model(GOOD, ticket_id="T-0000"))
 
 
@@ -146,6 +160,7 @@ def test_default_models_and_classes(monkeypatch):
     monkeypatch.setenv("PROVIDER", "groq")
     groq = agent.build_model()
     assert type(groq).__name__ == "ChatGroq" and groq.model_name == "openai/gpt-oss-120b"
+    assert groq.temperature < 1e-6  # ChatGroq turns 0 into 1e-08
     monkeypatch.setenv("MODEL", "custom-model")
     assert agent.build_model().model_name == "custom-model"
 

@@ -2,7 +2,7 @@
 title: 'The triage agent'
 type: 'feature'
 created: '2026-09-26'
-status: 'in-review'
+status: 'done'
 baseline_commit: '62bfdc8a581d4d9d7e5afbea24b0f2602eceb97e'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -76,6 +76,22 @@ context:
 ## Spec Change Log
 
 ## Review Triage Log
+
+Code review against `epic/2` (four layers).
+
+| Finding | Verdict | Route | Evidence |
+|---|---|---|---|
+| Policy tells the model to call `escalate_to_human`, which does not exist yet (acceptance) | medium | patch | Prompt now says the tool is unavailable and to return the decision only. Live check on P1 Enterprise ticket `T-1044` returned a decision. |
+| No test that the policy prompt reaches the model (gap) | medium | patch | Scripted model now records messages; test asserts the system message holds the policy and data-only rules. |
+| Retry re-sends the identical request (blind, edge) | medium | patch | Second attempt now adds the validation problem as a message; test asserts it. |
+| Unknown-ticket test matches any `Exception` (blind, edge, gap) | low | patch | Now `ToolException`. |
+| `temperature=0` not asserted (gap) | low | patch | Asserted (ChatGroq stores 1e-08). |
+| Gemini default path unverified (acceptance, blind) | maybe-false | defer | `GEMINI_API_KEY` in `.env` is rejected with `ACCESS_TOKEN_TYPE_UNSUPPORTED`. Needs a valid Gemini API key and a run of `T-1042`. |
+| `T-1099` gives `bug`/`P4` about 6 in 8 runs (acceptance, blind) | medium | defer | Model variance; the injection is always ignored. The criterion is in the frozen block, so a change goes through `/bmad-spec`. |
+| Model may skip tool calls and still pass validation (edge, acceptance) | low | defer | Order is prompt-enforced and checked in traces; Epic 3's eval is the place to score it. |
+| Ticket ID validation, timeout and step cap, MCP client reuse, tool-presence check, blank `PROVIDER`, shared `MODEL`, Gemini temperature | low | rejected | Unlikely in the workshop flow and each fix adds guards; `MODEL` shared by design in the spec. |
+| Test hygiene: mutable defaults, `C-77` hard-coded, fixture assumptions, PEP 8 blank line | low | rejected | Cosmetic; blank line fixed anyway. |
+| README task marked done with no change (blind) | false | rejected | The task said "only if it already documents `run_agent.py`". |
 
 ## Design Notes
 
