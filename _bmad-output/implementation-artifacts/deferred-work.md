@@ -11,8 +11,8 @@
 ## Deferred from: code review of 1-the-triage-agent (2026-09-26)
 
 - source_spec: `_bmad-output/specs/spec-epic-2/stories/1-the-triage-agent.md`
-  summary: The default Gemini path has not run live; `GEMINI_API_KEY` in `.env` is rejected with `ACCESS_TOKEN_TYPE_UNSUPPORTED`.
-  evidence: Needs a valid Gemini API key, then `uv run python run_agent.py T-1042` should print `billing`/`P2`/`billing-team`.
+  summary: RESOLVED 2026-09-26. The default Gemini path ran live after the key was replaced (`T-1042` gave `billing`/`P2`/`billing-team`). Remaining: Gemini trace order not checked.
+  evidence: A stale `GEMINI_API_KEY` in the shell overrides `.env`; unset it. Gemini free-tier quota (429) limited further runs.
 - source_spec: `_bmad-output/specs/spec-epic-2/stories/1-the-triage-agent.md`
   summary: `T-1099` returns `bug`/`P4` in about 6 of 8 runs on Groq (`P3` otherwise), though the injection is always ignored.
   evidence: Model variance at temperature 0. The acceptance criterion is in the frozen block, so loosening it goes through `/bmad-spec`.

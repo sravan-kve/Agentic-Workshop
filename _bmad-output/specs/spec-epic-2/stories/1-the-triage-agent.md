@@ -70,7 +70,7 @@ context:
 
 - `agent.py` `triage(ticket_id, *, model=None)`: the optional `model` lets tests inject a fake chat model. MCP tool errors are set to stop the run (`handle_tool_error = False`) so "No ticket with ID" surfaces. `ToolStrategy(TriageDecision, handle_errors=False)` sends schema failures to our single retry. Groq runs at `temperature=0`.
 - `README.md` needed no change.
-- Live results (2026-09-26): Groq `T-1042` gave `billing`/`P2`/`billing-team`; the MLflow trace shows `get_ticket` then `get_customer_history` with `C-77`. Groq `T-1099` gave `bug`/`P4` in 6 of 8 runs and `bug`/`P3` in 2, all ignoring the injected instruction, so P4 is model variance, not guaranteed. Gemini (default path) could not be verified: `GEMINI_API_KEY` in `.env` is rejected with `ACCESS_TOKEN_TYPE_UNSUPPORTED` (an OAuth-style token, not an API key). That is a credential problem, not code.
+- Live results (2026-09-26): Groq `T-1042` gave `billing`/`P2`/`billing-team`; the MLflow trace shows `get_ticket` then `get_customer_history` with `C-77`. Groq `T-1099` gave `bug`/`P4` in 6 of 8 runs and `bug`/`P3` in 2, all ignoring the injected instruction, so P4 is model variance, not guaranteed. Gemini (default path) was first blocked by a bad `GEMINI_API_KEY` (`ACCESS_TOKEN_TYPE_UNSUPPORTED`). After the key was replaced it worked; see the Review Triage Log.
 - Matrix audit: every row has an offline test except the injection row and the live provider rows, which the spec's Design Notes make manual checks.
 
 ## Spec Change Log
@@ -86,7 +86,7 @@ Code review against `epic/2` (four layers).
 | Retry re-sends the identical request (blind, edge) | medium | patch | Second attempt now adds the validation problem as a message; test asserts it. |
 | Unknown-ticket test matches any `Exception` (blind, edge, gap) | low | patch | Now `ToolException`. |
 | `temperature=0` not asserted (gap) | low | patch | Asserted (ChatGroq stores 1e-08). |
-| Gemini default path unverified (acceptance, blind) | maybe-false | defer | `GEMINI_API_KEY` in `.env` is rejected with `ACCESS_TOKEN_TYPE_UNSUPPORTED`. Needs a valid Gemini API key and a run of `T-1042`. |
+| Gemini default path unverified (acceptance, blind) | medium | resolved | The key in `.env` was rejected at review time. After the key was replaced, Gemini `T-1042` gave `billing`/`P2`/`billing-team` and `T-1099` gave `bug`/`P4` (2 of 2 completed runs; 2 more hit Gemini's 429 quota). Trace order on Gemini not checked; confirmed on Groq. Note: a stale `GEMINI_API_KEY` in the shell overrides `.env` (`load_dotenv` does not override), so unset it. |
 | `T-1099` gives `bug`/`P4` about 6 in 8 runs (acceptance, blind) | medium | defer | Model variance; the injection is always ignored. The criterion is in the frozen block, so a change goes through `/bmad-spec`. |
 | Model may skip tool calls and still pass validation (edge, acceptance) | low | defer | Order is prompt-enforced and checked in traces; Epic 3's eval is the place to score it. |
 | Ticket ID validation, timeout and step cap, MCP client reuse, tool-presence check, blank `PROVIDER`, shared `MODEL`, Gemini temperature | low | rejected | Unlikely in the workshop flow and each fix adds guards; `MODEL` shared by design in the spec. |
