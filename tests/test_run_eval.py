@@ -33,8 +33,13 @@ def test_loader_reads_all_real_rows():
     assert len(rows) == 20
     assert rows[0] == {
         "inputs": {"ticket_id": "T-1042"},
-        "expectations": {"expected_category": "billing", "expected_priority": "P2"},
+        "expectations": {
+            "expected_category": "billing",
+            "expected_priority": "P2",
+            "judge_notes": rows[0]["expectations"]["judge_notes"],
+        },
     }
+    assert rows[0]["expectations"]["judge_notes"].startswith("Double charge")
 
 
 def test_valid_schema():
@@ -90,6 +95,7 @@ def test_evaluate_one_run_with_scores(monkeypatch, tmp_path):
         return GOOD
 
     monkeypatch.setattr(agent, "triage", fake_triage)
+    _judge(monkeypatch, '{"verdict": "pass", "reason": "sound"}')
     monkeypatch.setenv("MLFLOW_GENAI_EVAL_MAX_WORKERS", "1")  # restored after the test
     previous_uri = mlflow.get_tracking_uri()
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
@@ -101,6 +107,9 @@ def test_evaluate_one_run_with_scores(monkeypatch, tmp_path):
         assert run_eval.approved_count() == 1 and run_eval.errored_count() == 1
         exp = mlflow.get_experiment_by_name("triage-agent-test")
         assert len(mlflow.search_runs([exp.experiment_id])) == 1
+        report = run_eval.build_report(result)
+        assert report["total_tokens"] == 0 and report["auto_approved_escalations"] == 1
+        assert report["run_id"] == result.run_id
     finally:
         mlflow.set_tracking_uri(previous_uri)
     # T-1042 matches its labels (billing/P2); T-1043 errors (0 on all four); T-1044 returns billing/P2 but is labelled access/P1
@@ -108,6 +117,10 @@ def test_evaluate_one_run_with_scores(monkeypatch, tmp_path):
     assert result.metrics["category_match/mean"] == pytest.approx(1 / 3)
     assert result.metrics["priority_match/mean"] == pytest.approx(1 / 3)
     assert result.metrics["tool_order/mean"] == pytest.approx(2 / 3)
+    df = result.result_df
+    assert sorted(df["rationale_judge/value"]) == ["fail", "pass", "pass"]
+    assert df["rationale_judge/rationale"].notna().all()
+    assert report["scorer_means"]["rationale_judge"] == pytest.approx(2 / 3)
 
 
 def test_approve_counts_each_ticket_once():
@@ -195,16 +208,192 @@ def test_worker_default_is_one_and_a_caller_value_is_kept(monkeypatch):
     assert seen == ["1", "3"]
 
 
-def test_main_prints_means_and_counts(monkeypatch, capsys):
+class FakeJudge:
+    def __init__(self, *replies):
+        self.replies, self.prompts = list(replies), []
+
+    def invoke(self, prompt):
+        self.prompts.append(prompt)
+        r = self.replies[min(len(self.prompts) - 1, len(self.replies) - 1)]
+        if isinstance(r, Exception):
+            raise r
+        return SimpleNamespace(content=r)
+
+
+JEXP = {**EXP, "judge_notes": "Double charge is P2."}
+
+
+def _judge(monkeypatch, *replies):
+    fake = FakeJudge(*replies)
+    monkeypatch.setattr(run_eval, "_judge_model", lambda: fake)
+    return fake
+
+
+def _run_judge(outputs=GOOD):
+    fb = run_eval.rationale_judge(outputs=outputs, expectations=JEXP)
+    return fb.value, fb.rationale
+
+
+def test_judge_pass_and_fail(monkeypatch):
+    fake = _judge(monkeypatch, '{"verdict": "pass", "reason": "sound"}', '{"verdict": "FAIL", "reason": "weak"}')
+    assert _run_judge() == ("pass", "sound")
+    assert _run_judge() == ("fail", "weak")
+    p = fake.prompts[0]
+    assert "Double charge is P2." in p and "billing-team" in p and "Double charge." in p
+
+
+@pytest.mark.parametrize("reply", ["maybe", '{"verdict": "great"}', "{}", '["pass"]', ""])
+def test_judge_unreadable_reply_is_a_fail(monkeypatch, reply):
+    _judge(monkeypatch, reply)
+    value, reason = _run_judge()
+    assert value == "fail" and reason.startswith("judge error:")
+
+
+def test_judge_call_failure_is_a_fail_without_retry(monkeypatch):
+    monkeypatch.setattr(run_eval.time, "sleep", lambda s: pytest.fail("slept"))
+    fake = _judge(monkeypatch, RuntimeError("groq down"))
+    value, reason = _run_judge()
+    assert value == "fail" and reason.startswith("judge error:") and len(fake.prompts) == 1
+
+
+def test_judge_retries_when_rate_limited(monkeypatch):
+    waits = []
+    monkeypatch.setattr(run_eval.time, "sleep", waits.append)
+    fake = _judge(monkeypatch, RuntimeError("Error code: 429. try again in 2s"), '{"verdict": "pass", "reason": "ok"}')
+    assert _run_judge() == ("pass", "ok")
+    assert len(fake.prompts) == 2 and waits == [3.0]
+
+
+def test_judge_gives_up_after_the_retry_limit(monkeypatch):
+    monkeypatch.setattr(run_eval.time, "sleep", lambda s: None)
+    fake = _judge(monkeypatch, RuntimeError("429 rate limit"))
+    value, reason = _run_judge()
+    assert value == "fail" and reason.startswith("judge error:") and len(fake.prompts) == run_eval.RATE_LIMIT_RETRIES + 1
+
+
+def test_judge_skips_model_for_agent_error(monkeypatch):
+    fake = _judge(monkeypatch, '{"verdict": "pass", "reason": "x"}')
+    value, _ = _run_judge({"error": "boom"})
+    assert value == "fail" and fake.prompts == []
+
+
+def test_judge_model_uses_groq_and_never_reads_gemini(monkeypatch):
+    import langchain_groq
+
+    seen = {}
+
+    class FakeGroq:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+    monkeypatch.setattr(langchain_groq, "ChatGroq", FakeGroq)
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    monkeypatch.delenv("JUDGE_MODEL", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    real_get = os.environ.get
+    monkeypatch.setattr(os.environ, "get", lambda k, *a: pytest.fail(k) if k == "GEMINI_API_KEY" else real_get(k, *a))
+    run_eval._judge_model()
+    assert seen["model"] == "openai/gpt-oss-120b" and seen["api_key"] == "k"
+
+
+def test_judge_model_env_override_reaches_chat_groq(monkeypatch):
+    import langchain_groq
+
+    seen = {}
+    monkeypatch.setattr(langchain_groq, "ChatGroq", lambda **kw: seen.update(kw))
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    monkeypatch.setenv("JUDGE_MODEL", "some-other-model")
+    run_eval._judge_model()
+    assert seen["model"] == "some-other-model"
+
+
+def test_sum_tokens_counts_missing_usage_as_zero():
+    def tr(usage):
+        return SimpleNamespace(info=SimpleNamespace(token_usage=usage))
+
+    assert run_eval.sum_tokens([tr({"total_tokens": 10}), tr(None), tr({}), tr({"total_tokens": 5})]) == 15
+
+
+def test_judge_pass_rate():
+    import pandas as pd
+
+    df = pd.DataFrame({"rationale_judge/value": ["pass", "fail", "pass", "pass"]})
+    assert run_eval.judge_pass_rate(df) == 0.75
+    assert run_eval.judge_pass_rate(pd.DataFrame()) is None
+
+
+def test_judge_pass_rate_excludes_nan_rows():
+    import pandas as pd
+
+    # a row an evaluate() run leaves blank shows up as NaN, not None, in a pandas column
+    df = pd.DataFrame({"rationale_judge/value": ["pass", "fail", float("nan")]})
+    assert run_eval.judge_pass_rate(df) == 0.5
+
+
+def test_total_tokens_only_sums_the_named_run(monkeypatch, tmp_path):
+    from mlflow.tracing.constant import SpanAttributeKey
+
+    def make_triage(tokens):
+        async def fake_triage(ticket_id, *, approve=None, **kw):
+            span = mlflow.get_current_active_span()
+            span.set_attribute(SpanAttributeKey.CHAT_USAGE, {"total_tokens": tokens})
+            return GOOD
+
+        return fake_triage
+
+    previous_uri = mlflow.get_tracking_uri()
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
+    try:
+        mlflow.set_experiment("triage-agent-tokens-test")
+        rows = [{"inputs": {"ticket_id": "T-1042"}, "expectations": EXP}]
+        monkeypatch.setattr(agent, "triage", make_triage(111))
+        other = run_eval.run_eval(rows)
+        monkeypatch.setattr(agent, "triage", make_triage(7))
+        this = run_eval.run_eval(rows)
+        assert other.run_id != this.run_id
+        # a broken run_id filter (summing the whole experiment) would pull the other run's
+        # 111 tokens into this one's total instead of keeping the two runs independent
+        assert run_eval.total_tokens(this.run_id) == 7
+        assert run_eval.total_tokens(other.run_id) == 111
+    finally:
+        mlflow.set_tracking_uri(previous_uri)
+
+
+def test_main_stops_without_groq_key(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr(run_eval, "run_eval", lambda: pytest.fail("ran a ticket"))
+    with pytest.raises(SystemExit) as e:
+        run_eval.main()
+    assert "GROQ_API_KEY" in str(e.value)
+
+
+def test_main_prints_and_writes_the_report(monkeypatch, capsys, tmp_path):
+    import pandas as pd
+
     setup = []
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("GROQ_API_KEY", "k")
     monkeypatch.setattr(mlflow, "set_tracking_uri", lambda uri: setup.append(("uri", uri)))
     monkeypatch.setattr(mlflow, "set_experiment", lambda name: setup.append(("exp", name)))
     monkeypatch.setattr(mlflow.langchain, "autolog", lambda: setup.append(("autolog", None)))
     metrics = {"valid_schema/mean": 1.0, "category_match/mean": 0.95, "priority_match/mean": 0.5}
-    monkeypatch.setattr(run_eval, "run_eval", lambda: SimpleNamespace(metrics=metrics))
+    df = pd.DataFrame({"rationale_judge/value": ["pass", "fail"]})
+    monkeypatch.setattr(run_eval, "run_eval", lambda: SimpleNamespace(metrics=metrics, result_df=df, run_id="r1"))
+    monkeypatch.setattr(run_eval, "total_tokens", lambda run_id: 1234)
+    report_path = tmp_path / "latest_report.json"
+    monkeypatch.setattr(run_eval, "REPORT_PATH", report_path)
+    monkeypatch.setattr(run_eval, "ROOT", tmp_path)
     run_eval.main()
     out = capsys.readouterr().out
     assert ("uri", "sqlite:///mlflow.db") in setup and ("exp", "triage-agent") in setup and ("autolog", None) in setup
     for line in ("valid_schema: 1.00", "category_match: 0.95", "priority_match: 0.50", "tool_order: n/a",
+                 "rationale_judge: 0.50", "total tokens: 1234",
                  "auto-approved escalations: ", "tickets with agent errors: "):
         assert line in out
+    import json
+
+    report = json.loads(report_path.read_text())
+    assert report["run_id"] == "r1" and report["total_tokens"] == 1234
+    assert report["scorer_means"]["rationale_judge"] == 0.5 and report["scorer_means"]["tool_order"] is None
+    assert set(report) == {"run_id", "scorer_means", "total_tokens", "auto_approved_escalations", "tickets_with_agent_errors"}
