@@ -264,6 +264,13 @@ def test_judge_retries_when_rate_limited(monkeypatch):
     assert len(fake.prompts) == 2 and waits == [3.0]
 
 
+def test_judge_gives_up_after_the_retry_limit(monkeypatch):
+    monkeypatch.setattr(run_eval.time, "sleep", lambda s: None)
+    fake = _judge(monkeypatch, RuntimeError("429 rate limit"))
+    value, reason = _run_judge()
+    assert value == "fail" and reason.startswith("judge error:") and len(fake.prompts) == run_eval.RATE_LIMIT_RETRIES + 1
+
+
 def test_judge_skips_model_for_agent_error(monkeypatch):
     fake = _judge(monkeypatch, '{"verdict": "pass", "reason": "x"}')
     value, _ = _run_judge({"error": "boom"})
@@ -289,6 +296,17 @@ def test_judge_model_uses_groq_and_never_reads_gemini(monkeypatch):
     assert seen["model"] == "openai/gpt-oss-120b" and seen["api_key"] == "k"
 
 
+def test_judge_model_env_override_reaches_chat_groq(monkeypatch):
+    import langchain_groq
+
+    seen = {}
+    monkeypatch.setattr(langchain_groq, "ChatGroq", lambda **kw: seen.update(kw))
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    monkeypatch.setenv("JUDGE_MODEL", "some-other-model")
+    run_eval._judge_model()
+    assert seen["model"] == "some-other-model"
+
+
 def test_sum_tokens_counts_missing_usage_as_zero():
     def tr(usage):
         return SimpleNamespace(info=SimpleNamespace(token_usage=usage))
@@ -302,6 +320,43 @@ def test_judge_pass_rate():
     df = pd.DataFrame({"rationale_judge/value": ["pass", "fail", "pass", "pass"]})
     assert run_eval.judge_pass_rate(df) == 0.75
     assert run_eval.judge_pass_rate(pd.DataFrame()) is None
+
+
+def test_judge_pass_rate_excludes_nan_rows():
+    import pandas as pd
+
+    # a row an evaluate() run leaves blank shows up as NaN, not None, in a pandas column
+    df = pd.DataFrame({"rationale_judge/value": ["pass", "fail", float("nan")]})
+    assert run_eval.judge_pass_rate(df) == 0.5
+
+
+def test_total_tokens_only_sums_the_named_run(monkeypatch, tmp_path):
+    from mlflow.tracing.constant import SpanAttributeKey
+
+    def make_triage(tokens):
+        async def fake_triage(ticket_id, *, approve=None, **kw):
+            span = mlflow.get_current_active_span()
+            span.set_attribute(SpanAttributeKey.CHAT_USAGE, {"total_tokens": tokens})
+            return GOOD
+
+        return fake_triage
+
+    previous_uri = mlflow.get_tracking_uri()
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
+    try:
+        mlflow.set_experiment("triage-agent-tokens-test")
+        rows = [{"inputs": {"ticket_id": "T-1042"}, "expectations": EXP}]
+        monkeypatch.setattr(agent, "triage", make_triage(111))
+        other = run_eval.run_eval(rows)
+        monkeypatch.setattr(agent, "triage", make_triage(7))
+        this = run_eval.run_eval(rows)
+        assert other.run_id != this.run_id
+        # a broken run_id filter (summing the whole experiment) would pull the other run's
+        # 111 tokens into this one's total instead of keeping the two runs independent
+        assert run_eval.total_tokens(this.run_id) == 7
+        assert run_eval.total_tokens(other.run_id) == 111
+    finally:
+        mlflow.set_tracking_uri(previous_uri)
 
 
 def test_main_stops_without_groq_key(monkeypatch):

@@ -2,7 +2,7 @@
 title: 'The rationale judge and the report'
 type: 'feature'
 created: '2026-09-26'
-status: 'in-review'
+status: 'done'
 baseline_commit: '5b8d8e39a119988bd1f112e50b282d241eecf87f'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -74,12 +74,30 @@ context:
 - `eval/run_eval.py`: `rationale_judge` scorer via a patchable `_judge_model()` (always `ChatGroq`, `JUDGE_MODEL`/`GROQ_API_KEY`, never `GEMINI_API_KEY`), a strict one-line-JSON prompt/parse (`_parse_verdict`), `judge_pass_rate` (mean computed from `result_df` since MLflow does not average text scores), `sum_tokens`/`total_tokens` (sum over the run's traces), `build_report`/`write_report`, and a `GROQ_API_KEY` pre-check in `main`.
 - `load_rows` adds `judge_notes` to each row's `expectations`.
 - Live result (Groq, 2026-09-26, 8 min 29 s): `valid_schema` 0.90, `category_match` 0.85, `priority_match` 0.90, `tool_order` 0.90, `rationale_judge` 0.80, total tokens 65390, 3 auto-approved escalations, 2 tickets with agent errors. `eval/latest_report.json` matches the printed numbers exactly. Confirmed against traces directly: 20 traces, summed trace tokens equal the reported total, and the errored ticket's `rationale_judge` assessment is `fail` with "the agent failed on this ticket; no judge call".
-- The 2 agent errors are provider issues already known from story 2.2, not new: `T-1099` hit a network `Connection error`, and `T-1048` hit Groq's `tool_use_failed` flake (deferred in story 2.2's review). Neither is caused by this story's code.
+- The 2 agent errors were provider issues already known from story 2.2, not new: `T-1099` hit a network `Connection error`, and `T-1048` hit Groq's `tool_use_failed` flake (deferred in story 2.2's review). Neither was caused by this story's code.
+- After review fixes: a second confirmation run (2026-09-27, 6 min 3 s, 0 agent errors) gave `valid_schema` 1.00, `category_match` 1.00, `priority_match` 0.95, `tool_order` 1.00, `rationale_judge` 0.95, total tokens 70656, 3 auto-approved escalations. `eval/latest_report.json` matched. `total_tokens` now calls `mlflow.flush_trace_async_logging()` before searching, and a new test proves it sums only the named run's traces (not another run's in the same experiment) using real per-span token usage, not a mock.
 - Run took 8 min 29 s at 1 worker, since the judge now shares Groq's tokens-per-minute limit with the agent.
 
 ## Spec Change Log
 
 ## Review Triage Log
+
+Code review against `epic/3` (four layers, two reviewers needed one relaunch after a transient connection error). No violation of CAP-6 or CAP-7.
+
+| Finding | Verdict | Route | Evidence |
+|---|---|---|---|
+| `judge_pass_rate` counted a pandas `NaN` cell as a fail instead of excluding it (blind) | medium | patch | `v is not None` does not catch `NaN` (a float). Fixed with `v == v` (NaN excludes itself); test added. |
+| No test for the judge exhausting all retries (blind, gap) | medium | patch | Only the retry-then-succeed path was tested. Test added: `RATE_LIMIT_RETRIES + 1` calls, ends `fail`. |
+| `JUDGE_MODEL` override never confirmed to reach `ChatGroq` (blind, gap) | medium | patch | Only the default was asserted. Test added with `JUDGE_MODEL` set to a non-default value. |
+| `total_tokens`'s `run_id` filter never tested against a second run in the same experiment; trace export is async and nothing flushed before searching (gap) | medium | patch | Added `mlflow.flush_trace_async_logging()` before search, and a test with real per-span token usage across two runs proving the totals stay independent. |
+| Prompt construction sat outside the try/except around the judge call (edge) | low | patch | A formatting error would have crashed the ticket instead of scoring `fail`. Moved inside the loop. |
+| `write_report` could raise after a successful run and hide the already-computed results (edge) | low | patch | Now wrapped; scores print first, and a write failure reports itself instead of crashing. |
+| Judge's `ChatGroq.invoke()` leaking into the run's traces via autolog, inflating `total_tokens` (blind) | medium | false | Live run showed exactly 20 traces for 20 tickets with token counts matching the report; extra traces would have shown up in the count. |
+| Retry loop duplicated between `predict` and `rationale_judge` (blind) | low | rejected | Works correctly; a shared helper is a refactor, not a fix. |
+| A malformed (not `{"error"}`) agent output still spends a live judge call (blind) | low | rejected | `valid_schema` already scores such an output 0; not in the frozen matrix. |
+| Unbounded exception text in `_judge_error` for exhausted retries; JSON preamble text not stripped; `expectations` not guarded as a dict; `run_eval()` bypasses the key check when called directly (edge) | low | rejected | Low likelihood in the workshop flow; each fix adds guards the spec does not ask for. |
+| `REPORT_PATH.relative_to(ROOT)` couples the print to two globals (blind) | low | rejected | Cosmetic. |
+| AGENTS.md not updated for the new `GROQ_API_KEY` hard dependency and report file (blind) | low | defer | Fix would edit an agent-context file, out of scope for a story. |
 
 ## Design Notes
 

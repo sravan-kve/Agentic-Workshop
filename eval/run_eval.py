@@ -196,15 +196,15 @@ def _parse_verdict(text) -> Feedback:
 def rationale_judge(outputs, expectations):
     if not isinstance(outputs, dict) or "error" in outputs:
         return Feedback(value="fail", rationale="the agent failed on this ticket; no judge call")
-    prompt = JUDGE_PROMPT.format(
-        category=outputs.get("category"),
-        priority=outputs.get("priority"),
-        route=outputs.get("route"),
-        rationale=outputs.get("rationale"),
-        notes=expectations.get("judge_notes", ""),
-    )
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         try:
+            prompt = JUDGE_PROMPT.format(
+                category=outputs.get("category"),
+                priority=outputs.get("priority"),
+                route=outputs.get("route"),
+                rationale=outputs.get("rationale"),
+                notes=expectations.get("judge_notes", ""),
+            )
             return _parse_verdict(_judge_model().invoke(prompt).content)
         except Exception as err:  # noqa: BLE001 - a failed judge call is a fail, not a stopped run
             if _is_rate_limit(err) and attempt < RATE_LIMIT_RETRIES:
@@ -234,7 +234,7 @@ def judge_pass_rate(result_df) -> float | None:
     column = "rationale_judge/value"
     if result_df is None or column not in result_df:
         return None
-    values = [str(v).lower() for v in result_df[column] if v is not None]
+    values = [str(v).lower() for v in result_df[column] if v is not None and v == v]  # v == v excludes NaN
     return sum(v == "pass" for v in values) / len(values) if values else None
 
 
@@ -248,6 +248,7 @@ def sum_tokens(traces) -> int:
 
 
 def total_tokens(run_id: str) -> int:
+    mlflow.flush_trace_async_logging()  # trace export is async; search right after a run can otherwise miss usage
     experiment_id = mlflow.get_run(run_id).info.experiment_id
     traces = mlflow.search_traces(locations=[experiment_id], run_id=run_id, return_type="list")
     return sum_tokens(traces)
@@ -285,13 +286,16 @@ def main() -> None:
 
     result = run_eval()
     report = build_report(result)
-    write_report(report)
     for name, value in report["scorer_means"].items():
         print(f"{name}: {value:.2f}" if value is not None else f"{name}: n/a")
     print(f"total tokens: {report['total_tokens']}")
     print(f"auto-approved escalations: {report['auto_approved_escalations']}")
     print(f"tickets with agent errors: {report['tickets_with_agent_errors']}")
-    print(f"report: {REPORT_PATH.relative_to(ROOT)}")
+    try:
+        write_report(report)
+        print(f"report: {REPORT_PATH.relative_to(ROOT)}")
+    except OSError as err:  # the eval already succeeded; a report-write failure must not hide that
+        print(f"could not write {REPORT_PATH.name}: {err}")
 
 
 if __name__ == "__main__":
